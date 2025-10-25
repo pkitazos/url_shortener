@@ -1,4 +1,8 @@
-use std::{collections::HashMap, error::Error};
+use std::{
+    collections::HashMap,
+    error::Error,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Router,
@@ -12,13 +16,15 @@ use sqlx::{FromRow, Pool, Sqlite, SqlitePool};
 #[derive(Debug, Clone)]
 struct AppCtx {
     pool: Pool<Sqlite>,
-    cache: HashMap<String, String>,
+    stl_cache: Arc<Mutex<HashMap<String, String>>>, // coule probably do with better names
+    lts_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AppCtx {
     fn new(pool: Pool<Sqlite>) -> AppCtx {
         AppCtx {
-            cache: HashMap::new(),
+            stl_cache: Arc::new(Mutex::new(HashMap::new())),
+            lts_cache: Arc::new(Mutex::new(HashMap::new())),
             pool,
         }
     }
@@ -32,7 +38,7 @@ struct URL {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let pool = SqlitePool::connect("sqlite::memory:").await?;
+    let pool = SqlitePool::connect("sqlite:urlshortener.db").await?; // expects the file to already exist
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -50,9 +56,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn root() -> String {
+async fn root() -> impl IntoResponse {
     println!("/ GET <--");
-    return "Hello, World!".to_string();
+    return (StatusCode::OK, "Hello, World!".to_string());
 }
 
 fn cool_shortener(long_url: &String) -> String {
@@ -63,17 +69,24 @@ fn cool_shortener(long_url: &String) -> String {
 
 /// C -> S : shorten(long_url) ... S -> C : success(short_code)
 async fn shorten(
-    State(mut ctx): State<AppCtx>,
+    State(ctx): State<AppCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Some(long_url) = params.get("q") {
         println!("/shorten POST <-- {}", long_url);
 
-        if let Some(short_code) = ctx.cache.get(long_url) {
-            // already in cache, means already in db, can just return
-            return (StatusCode::OK, short_code.to_owned());
+        {
+            // acquire lock on lts
+            let lts_cache = ctx.lts_cache.lock().unwrap();
+            if let Some(short_code) = lts_cache.get(long_url) {
+                println!("\tfound in cache");
+                // already in cache, means already in db, can just return
+                return (StatusCode::OK, short_code.to_owned());
+            }
+            // release lock on lts
         }
 
+        println!("\tcache miss - new entry");
         let short_code = cool_shortener(&long_url);
         println!("\tshortened to: {}", short_code);
 
@@ -83,8 +96,23 @@ async fn shorten(
         };
 
         if let Ok(_) = store_entry(&url, &ctx.pool).await {
+            println!("\tsaved to db");
             // already checked that it's not in the cache
-            ctx.cache.insert(long_url.clone(), short_code.clone());
+
+            {
+                // acquire lock on lts
+                let mut lts_cache = ctx.lts_cache.lock().unwrap();
+                lts_cache.insert(long_url.clone(), short_code.clone());
+                println!("\tstoring in lts cache");
+                // release lock on lts
+            }
+            {
+                // acquire lock on stl
+                let mut stl_cache = ctx.stl_cache.lock().unwrap();
+                stl_cache.insert(short_code.clone(), long_url.clone());
+                println!("\tstoring in stl cache");
+                // release lock on stl
+            }
 
             return (StatusCode::OK, short_code);
         } else {
@@ -104,10 +132,14 @@ async fn shorten(
 /// }
 async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> impl IntoResponse {
     println!("/redirect GET <-- {}", short_code);
-
-    if let Some(long_url) = ctx.cache.get(&short_code) {
-        println!("\tfound in cache");
-        return (StatusCode::OK, long_url.to_owned());
+    {
+        // acquire lock on stl
+        let stl_cache = ctx.stl_cache.lock().unwrap();
+        if let Some(long_url) = stl_cache.get(&short_code) {
+            println!("\tfound in cache");
+            return (StatusCode::OK, long_url.to_owned());
+        }
+        // release lock on stl
     }
     println!("\tcache miss - looking in db");
 
@@ -125,14 +157,16 @@ async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> 
 
 /// S -> D : store(URL) . D -> S : ok() . D -> S : ok() . end,
 async fn store_entry(url: &URL, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
-    let query = "INSERT INTO url (long_url, short_code) VALUES ($1, $2)";
+    let long_url = &url.long_url;
+    let short_code = &url.short_code;
 
-    // ? use macro for type-checking ?
-    sqlx::query(query)
-        .bind(&url.long_url)
-        .bind(&url.short_code)
-        .execute(pool)
-        .await?;
+    sqlx::query!(
+        "INSERT INTO url (long_url, short_code) VALUES ($1, $2)",
+        long_url,
+        short_code
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -145,11 +179,7 @@ async fn lookup_entry(
     short_code: &String,
     pool: &sqlx::SqlitePool,
 ) -> Result<Option<URL>, sqlx::Error> {
-    let query = "SELECT * FROM url WHERE short_url = $1";
-
-    // ? use macro for type-checking ?
-    let res = sqlx::query_as::<_, URL>(query)
-        .bind(&short_code)
+    let res = sqlx::query_as!(URL, "SELECT * FROM url WHERE short_code = $1", short_code)
         .fetch_optional(pool)
         .await?;
 

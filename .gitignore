@@ -1,2 +1,4 @@
 /target
-.sqlite
+urlshortener.db
+.env
+.sqlx

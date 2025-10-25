@@ -1,5 +1,7 @@
 # URL shortener
 
+A tiny URL shortening service (Rust by the way) that converts long URLs into short codes and redirects users back to the original URLs.
+
 ## Sequence Diagram
 ```mmd
 sequenceDiagram

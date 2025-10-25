@@ -39,7 +39,7 @@ struct URL {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let pool = SqlitePool::connect("sqlite:urlshortener.db").await?; // expects the file to already exist
+    let pool = SqlitePool::connect("sqlite:urlshortener.db").await?; // ! expects the file to already exist
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 

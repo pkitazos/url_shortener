@@ -17,7 +17,7 @@ use sqlx::{FromRow, Pool, Sqlite, SqlitePool};
 #[derive(Debug, Clone)]
 struct AppCtx {
     pool: Pool<Sqlite>,
-    short_to_long_cache: Arc<Mutex<HashMap<String, String>>>, // coule probably do with better names
+    short_to_long_cache: Arc<Mutex<HashMap<String, String>>>,
     long_to_short_cache: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn root() -> impl IntoResponse {
     println!("/ GET <--");
-    return (StatusCode::OK, "Hello, World!".to_string());
+    (StatusCode::OK, "Hello, World!".to_string());
 }
 
 fn cool_shortener(long_url: &String) -> String {
@@ -73,16 +73,17 @@ async fn shorten(
     State(ctx): State<AppCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    println!("/shorten POST <-- ");
-
-    let Some(long_url) = params.get("q") else {
+    let Some(long_url) = params.get("q").map(|q| q.to_owned()) else {
+        println!("/shorten POST <--");
         return (StatusCode::BAD_REQUEST, "URL was not provided".to_owned());
     };
+
+    println!("/shorten POST <-- {}", &long_url);
 
     {
         // acquire lock
         let long_to_short_cache = ctx.long_to_short_cache.lock().unwrap();
-        match long_to_short_cache.get(long_url) {
+        match long_to_short_cache.get(&long_url) {
             Some(short_code) => {
                 println!("\tfound in cache");
                 // already in cache, means already in db, can just return
@@ -100,13 +101,12 @@ async fn shorten(
     let short_code = cool_shortener(&long_url);
     println!("\tshortened to: {}", &short_code);
 
-    // I would like to avoid the cloning here
     let url = URL {
         long_url: long_url.clone(),
         short_code: short_code.clone(),
     };
 
-    match store_entry(&url, &ctx.pool).await {
+    match store_entry(url, &ctx.pool).await {
         Ok(_) => {
             {
                 // acquire lock
@@ -130,8 +130,20 @@ async fn shorten(
 
         Err(e) => {
             eprintln!("Failed to store entry: {}", e);
-            // posibly because we're violating a uniqueness constraint
-            // but it could also be due to some other reason
+            // in the window between lock release and acquisition
+            // it's possible that another thread added the short code into the db
+            // and so we are violating the uniqueness constraint
+
+            // in that case we just check the cache again
+            // to see if the other thread added the short code
+
+            let long_to_short_cache = ctx.long_to_short_cache.lock().unwrap();
+            if let Some(existing_code) = long_to_short_cache.get(&long_url) {
+                println!("\tother thread already stored short code");
+                return (StatusCode::OK, existing_code.to_owned());
+            }
+
+            // otherwise something else happened so we just return an error
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong on our end".to_owned(),
@@ -197,7 +209,7 @@ async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> 
 }
 
 /// S -> D : store(URL) . D -> S : ok() . D -> S : ok() . end,
-async fn store_entry(url: &URL, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+async fn store_entry(url: URL, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     let long_url = &url.long_url;
     let short_code = &url.short_code;
 
@@ -225,9 +237,4 @@ async fn lookup_entry(
         .await?;
 
     Ok(res)
-}
-
-async fn reset_database(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query!("DELETE FROM url").execute(pool).await?;
-    Ok(())
 }

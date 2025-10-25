@@ -9,7 +9,7 @@ use axum::{
     Router,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
 };
 use sqlx::{FromRow, Pool, Sqlite, SqlitePool};
@@ -40,7 +40,6 @@ struct URL {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let pool = SqlitePool::connect("sqlite:urlshortener.db").await?; // expects the file to already exist
-    reset_database(&pool).await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -74,84 +73,65 @@ async fn shorten(
     State(ctx): State<AppCtx>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if let None = params.get("q") {
+    println!("/shorten POST <-- ");
+
+    let Some(long_url) = params.get("q") else {
         return (StatusCode::BAD_REQUEST, "URL was not provided".to_owned());
+    };
+
+    {
+        // acquire lock
+        let long_to_short_cache = ctx.long_to_short_cache.lock().unwrap();
+        match long_to_short_cache.get(long_url) {
+            Some(short_code) => {
+                println!("\tfound in cache");
+                // already in cache, means already in db, can just return
+                return (StatusCode::OK, short_code.to_owned());
+            }
+            None => {
+                println!("\tcache miss - new entry");
+                // not in cache, means its a new entry
+            }
+        }
+        // lock is released
     }
 
-    let long_url = params.get("q").unwrap();
-    println!("/shorten POST <-- {}", long_url);
-
+    // not in cache, so add it
     let short_code = cool_shortener(&long_url);
+    println!("\tshortened to: {}", &short_code);
 
-    let mut long_to_short_cache = ctx.long_to_short_cache.lock().unwrap();
-    if let Some(short_code) = long_to_short_cache.get(long_url) {
-        println!("\tfound in cache");
-        // already in cache, means already in db, can just return
-        (StatusCode::OK, short_code.to_owned())
-    } else {
-        // not in cache, so add it
-        println!("\tcache miss - new entry");
-        println!("\tshortened to: {}", short_code);
-        long_to_short_cache.insert(long_url.clone(), short_code.clone());
-        println!("\tstoring in stl cache");
+    // I would like to avoid the cloning here
+    let url = URL {
+        long_url: long_url.clone(),
+        short_code: short_code.clone(),
+    };
 
-        let url = URL {
-            long_url: long_url.clone(),
-            short_code: short_code.clone(),
-        };
-
-        match store_entry(url, &ctx.pool).await {
-            Ok(_) => {
-                // already added it to stl cache
-                println!("\tsaved to db");
-                (StatusCode::OK, short_code)
+    match store_entry(&url, &ctx.pool).await {
+        Ok(_) => {
+            {
+                // acquire lock
+                let mut long_to_short_cache = ctx.long_to_short_cache.lock().unwrap();
+                long_to_short_cache.insert(long_url.clone(), short_code.clone());
+                println!("\tstoring in lts cache");
+                // release lock
             }
 
-            Err(e) => {
-                eprintln!("Failed to store entry: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Something went wrong on our end".to_owned(),
-                )
+            {
+                // acquire lock
+                let mut short_to_long_cache = ctx.short_to_long_cache.lock().unwrap();
+                short_to_long_cache.insert(short_code.clone(), long_url.clone());
+                println!("\tstoring in stl cache");
+                // release lock
             }
+
+            println!("\tsaved to db");
+            (StatusCode::OK, short_code)
         }
-    }
-}
 
-/// C -> S : redirect(short_code) ...  S -> C : {
-///     found(long_url),
-///     not_found()
-/// }
-async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> impl IntoResponse {
-    println!("/redirect GET <-- {}", short_code);
-
-    // acquire lock on stl
-    let mut short_to_long_cache = ctx.short_to_long_cache.lock().unwrap();
-    if let Some(long_url) = short_to_long_cache.get(&short_code) {
-        println!("\tfound in cache");
-        return (StatusCode::OK, long_url.to_owned());
-    }
-    // release lock on stl
-
-    println!("\tcache miss - looking in db");
-
-    match lookup_entry(&short_code, &ctx.pool).await {
-        Ok(Some(url)) => {
-            println!("\tfound in db");
-
-            short_to_long_cache.insert(short_code.clone(), url.long_url.clone());
-            println!("\tstoring in stl cache");
-            (StatusCode::OK, url.long_url.to_owned())
-        }
-        Ok(None) => {
-            println!("\tnot in db");
-            (
-                StatusCode::NOT_FOUND,
-                "Short code not recognised".to_owned(),
-            )
-        }
         Err(e) => {
-            eprintln!("Failed to lookup entry: {}", e);
+            eprintln!("Failed to store entry: {}", e);
+            // posibly because we're violating a uniqueness constraint
+            // but it could also be due to some other reason
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong on our end".to_owned(),
@@ -160,8 +140,64 @@ async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> 
     }
 }
 
+/// C -> S : redirect(short_code) ...  S -> C : {
+///     found(long_url),
+///     not_found()
+/// }
+async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> Response {
+    println!("/redirect GET <-- {}", short_code);
+
+    {
+        // acquire lock on stl
+        let short_to_long_cache = ctx.short_to_long_cache.lock().unwrap();
+        match short_to_long_cache.get(&short_code) {
+            Some(long_url) => {
+                println!("\tfound in cache");
+                return Redirect::permanent(&long_url).into_response();
+            }
+            None => {
+                println!("\tcache miss - looking in db");
+                // not in cache, let's check db
+            }
+        }
+        // release lock on stl
+    }
+
+    match lookup_entry(&short_code, &ctx.pool).await {
+        Ok(Some(url)) => {
+            println!("\tfound in db");
+            {
+                // acquire lock
+                let mut short_to_long_cache = ctx.short_to_long_cache.lock().unwrap();
+                short_to_long_cache.insert(short_code.clone(), url.long_url.clone());
+                println!("\tstoring in stl cache");
+                // release lock
+            }
+            return Redirect::permanent(&url.long_url).into_response();
+        }
+
+        Ok(None) => {
+            println!("\tnot in db");
+            (
+                StatusCode::NOT_FOUND,
+                "Short code not recognised".to_owned(),
+            )
+                .into_response()
+        }
+
+        Err(e) => {
+            eprintln!("Failed to lookup entry: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong on our end".to_owned(),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// S -> D : store(URL) . D -> S : ok() . D -> S : ok() . end,
-async fn store_entry(url: URL, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
+async fn store_entry(url: &URL, pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     let long_url = &url.long_url;
     let short_code = &url.short_code;
 

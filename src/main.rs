@@ -39,6 +39,7 @@ struct URL {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let pool = SqlitePool::connect("sqlite:urlshortener.db").await?; // expects the file to already exist
+    reset_database(&pool).await?;
 
     sqlx::migrate!("./migrations").run(&pool).await?;
 
@@ -184,4 +185,9 @@ async fn lookup_entry(
         .await?;
 
     Ok(res)
+}
+
+async fn reset_database(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query!("DELETE FROM url").execute(pool).await?;
+    Ok(())
 }

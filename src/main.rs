@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .route("/", get(root))
         .route("/shorten", post(shorten)) // passing the long url as a query param
         .route("/redirect/{short_code}", get(redirect))
+        .route("/expand/{short_code}", get(expand))
         .with_state(AppCtx::new(pool));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -62,7 +63,7 @@ async fn root() -> impl IntoResponse {
     (StatusCode::OK, "Hello, World!".to_string());
 }
 
-fn cool_shortener(long_url: &String) -> String {
+fn hash_url(long_url: &String) -> String {
     let mut s = DefaultHasher::new();
     long_url.hash(&mut s);
     format!("{:x}", s.finish())
@@ -98,7 +99,7 @@ async fn shorten(
     }
 
     // not in cache, so add it
-    let short_code = cool_shortener(&long_url);
+    let short_code = hash_url(&long_url);
     println!("\tshortened to: {}", &short_code);
 
     let url = URL {
@@ -159,13 +160,36 @@ async fn shorten(
 async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> Response {
     println!("/redirect GET <-- {}", short_code);
 
+    match lookup_with_cache(&ctx, &short_code).await {
+        Ok(long_url) => Redirect::permanent(&long_url).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// C -> S : expand(short_code) ...  S -> C : {
+///     found(long_url),
+///     not_found()
+/// }
+async fn expand(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> impl IntoResponse {
+    println!("/expand GET <-- {}", short_code);
+
+    match lookup_with_cache(&ctx, &short_code).await {
+        Ok(long_url) => (StatusCode::OK, long_url).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn lookup_with_cache(
+    ctx: &AppCtx,
+    short_code: &String,
+) -> Result<String, (StatusCode, String)> {
     {
         // acquire lock on stl
         let short_to_long_cache = ctx.short_to_long_cache.lock().unwrap();
-        match short_to_long_cache.get(&short_code) {
+        match short_to_long_cache.get(short_code) {
             Some(long_url) => {
                 println!("\tfound in cache");
-                return Redirect::permanent(&long_url).into_response();
+                return Ok(long_url.to_owned());
             }
             None => {
                 println!("\tcache miss - looking in db");
@@ -185,25 +209,23 @@ async fn redirect(State(ctx): State<AppCtx>, Path(short_code): Path<String>) -> 
                 println!("\tstoring in stl cache");
                 // release lock
             }
-            return Redirect::permanent(&url.long_url).into_response();
+            Ok(url.long_url.to_owned())
         }
 
         Ok(None) => {
             println!("\tnot in db");
-            (
+            Err((
                 StatusCode::NOT_FOUND,
                 "Short code not recognised".to_owned(),
-            )
-                .into_response()
+            ))
         }
 
         Err(e) => {
             eprintln!("Failed to lookup entry: {}", e);
-            (
+            Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong on our end".to_owned(),
-            )
-                .into_response()
+            ))
         }
     }
 }
